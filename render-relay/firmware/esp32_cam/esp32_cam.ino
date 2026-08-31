@@ -36,7 +36,8 @@ using namespace websockets;
 
 const char *WIFI_SSID = "CAMBIA_SSID";
 const char *WIFI_PASSWORD = "CAMBIA_PASSWORD";
-const char *WS_URL = "wss://TU-APP.onrender.com/ws?role=device";
+const char *DEVICE_TOKEN = "change-me-device-token";
+const char *WS_URL = "wss://TU-APP.onrender.com/ws?role=device&token=change-me-device-token";
 const char *BOARD_ID = "esp32cam-01";
 
 WebsocketsClient ws;

@@ -2,6 +2,7 @@
 
 const http = require("http");
 const path = require("path");
+const crypto = require("crypto");
 const express = require("express");
 const { WebSocketServer } = require("ws");
 
@@ -9,7 +10,12 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true, maxPayload: 2 * 1024 * 1024 });
 const PORT = Number(process.env.PORT || 3000);
+const SESSION_MS = 30 * 60 * 1000;
+const ADMIN_USER = process.env.ADMIN_USER || "admin";
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "change-me-now";
+const DEVICE_TOKEN = process.env.DEVICE_TOKEN || "change-me-device-token";
 const clients = new Set();
+const sessions = new Map();
 const state = { online: false, streaming: false, recording: false, sd: false, camera: false, board: "", ip: "" };
 let device = null;
 let download = null;
@@ -18,6 +24,28 @@ const open = (ws) => ws && ws.readyState === 1;
 const json = (ws, value) => { if (open(ws)) ws.send(JSON.stringify(value)); };
 const broadcast = (value) => clients.forEach((ws) => json(ws, value));
 const toDevice = (value) => open(device) ? (json(device, value), true) : false;
+
+function parseCookies(header = "") {
+  return Object.fromEntries(header.split(";").map((part) => part.trim().split("=")).filter(([key, value]) => key && value).map(([key, value]) => [key, decodeURIComponent(value)]));
+}
+
+function sessionFromRequest(req) {
+  const token = parseCookies(req.headers.cookie).centinela_session;
+  const session = token && sessions.get(token);
+  if (!session || session.expiresAt < Date.now()) { if (token) sessions.delete(token); return null; }
+  session.expiresAt = Date.now() + SESSION_MS;
+  return session;
+}
+
+function requireSession(req, res, next) {
+  if (!sessionFromRequest(req)) return res.status(401).json({ error: "authentication_required" });
+  next();
+}
+
+function rejectUpgrade(socket) {
+  socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+  socket.destroy();
+}
 
 function safeFile(value) {
   if (typeof value !== "string") return null;
@@ -156,6 +184,8 @@ server.on("upgrade", (req, socket, head) => {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
   if (url.pathname !== "/ws") return socket.destroy();
   const role = (url.searchParams.get("role") || "client").toLowerCase();
+  if (role === "device" && url.searchParams.get("token") !== DEVICE_TOKEN) return rejectUpgrade(socket);
+  if (role !== "device" && !sessionFromRequest(req)) return rejectUpgrade(socket);
   wss.handleUpgrade(req, socket, head, (ws) => {
     ws.isAlive = true; ws.on("pong", () => { ws.isAlive = true; }); ws.on("error", () => {}); ws.on("close", () => disconnected(ws));
     if (role === "device") {
@@ -167,8 +197,23 @@ server.on("upgrade", (req, socket, head) => {
   });
 });
 
+app.use(express.urlencoded({ extended: false }));
 app.get("/health", (_req, res) => res.json({ ok: true, deviceOnline: state.online }));
-app.get("/api/download/*", startDownloadResponse);
+app.get("/api/session", (req, res) => { const session = sessionFromRequest(req); res.json({ authenticated: Boolean(session), user: session ? session.user : null }); });
+app.post("/api/login", (req, res) => {
+  if (req.body.user !== ADMIN_USER || req.body.password !== ADMIN_PASSWORD) return res.status(401).json({ error: "invalid_credentials" });
+  const token = crypto.randomBytes(32).toString("hex");
+  sessions.set(token, { user: ADMIN_USER, expiresAt: Date.now() + SESSION_MS });
+  res.setHeader("Set-Cookie", `centinela_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${SESSION_MS / 1000}${process.env.NODE_ENV === "production" ? "; Secure" : ""}`);
+  res.json({ ok: true, user: ADMIN_USER });
+});
+app.post("/api/logout", (req, res) => {
+  const token = parseCookies(req.headers.cookie).centinela_session;
+  if (token) sessions.delete(token);
+  res.setHeader("Set-Cookie", "centinela_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0");
+  res.json({ ok: true });
+});
+app.get("/api/download/*", requireSession, startDownloadResponse);
 app.use(express.static(path.join(__dirname, "public")));
 app.get("*", (_req, res) => res.sendFile(path.join(__dirname, "public", "index.html")));
 
